@@ -19,6 +19,8 @@ import (
 	"io"
 	"io/ioutil"
 	"reflect"
+	"regexp"
+	"strings"
 
 	"github.com/knadh/koanf"
 	"github.com/knadh/koanf/parsers/yaml"
@@ -27,6 +29,11 @@ import (
 	"github.com/knadh/koanf/providers/rawbytes"
 	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/cast"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
 const (
@@ -41,12 +48,127 @@ func NewParser() *Parser {
 
 // NewParserFromFile creates a new Parser by reading the given file.
 func NewParserFromFile(fileName string) (*Parser, error) {
-	// Read yaml config from file.
-	p := NewParser()
-	if err := p.k.Load(file.Provider(fileName), yaml.Parser()); err != nil {
-		return nil, fmt.Errorf("unable to read the file %v: %w", fileName, err)
+
+	//Terrible awful code
+	listOfFiles := strings.Fields(fileName)
+	configs := make(map[string]koanf.Koanf)
+
+	fmt.Println(listOfFiles)
+
+	for _, specificFile := range listOfFiles {
+		match, _ := regexp.MatchString("https://.+\\.s3\\..+\\.amazonaws\\.com/.+", specificFile)
+		if match {
+			params := getParams("https://(?P<Bucket>.+)\\.s3\\.(?P<Region>.+)\\.amazonaws\\.com/(?P<Key>.+)", specificFile)
+			configs[specificFile] = *getS3Config(params["Bucket"], params["Region"], params["Key"])
+		} else {
+			configs[specificFile] = *getFileConfig(specificFile)
+		}
 	}
+
+	mergeKeys := []string{"receivers", "processors", "exporters", "service"}
+	p := NewParser()
+	mergeKoanfConfigs(configs, mergeKeys, p.k)
+
+	b, _ := p.k.Marshal(yaml.Parser())
+	fmt.Println(string(b))
+
+	/*
+		// Read yaml config from file.
+		p := NewParser()
+		if err := p.k.Load(file.Provider(fileName), yaml.Parser()); err != nil {
+			return nil, fmt.Errorf("unable to read the file %v: %w", fileName, err)
+		}
+	*/
 	return p, nil
+}
+
+func getFileConfig(filename string) *koanf.Koanf {
+	var k = koanf.New(KeyDelimiter)
+	err := k.Load(file.Provider(filename), yaml.Parser())
+	if err != nil {
+		panic(err)
+	}
+	return k
+}
+
+func mergeKoanfConfigs(inputConfigs map[string]koanf.Koanf, mergeKeys []string, master *koanf.Koanf) map[string][]string {
+	componentToFiles := make(map[string][]string)
+	for _, mergeKey := range mergeKeys {
+		for filename, conf := range inputConfigs {
+			// Put each component into the new map
+			cutConfKeys := conf.MapKeys(mergeKey)
+			for _, cutKey := range cutConfKeys {
+				val, ok := componentToFiles[cutKey]
+				if ok {
+					val = append(val, filename)
+					componentToFiles[cutKey] = val
+				} else {
+					componentToFiles[cutKey] = []string{filename}
+				}
+			}
+			// If not put it into the master config
+			master.MergeAt(conf.Cut(mergeKey), mergeKey)
+		}
+	}
+
+	for k, v := range componentToFiles {
+		if len(v) > 1 {
+			fmt.Println("Duplicate Value")
+			fmt.Println(k)
+			fmt.Println(v)
+		}
+	}
+	// Component to files allows upstream code to easily attribute errors
+	return componentToFiles
+}
+
+func getS3Config(bucket string, region string, key string) *koanf.Koanf {
+	buf := &aws.WriteAtBuffer{}
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(region)},
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	downloader := s3manager.NewDownloader(sess)
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	}
+
+	_, err = downloader.Download(buf, input)
+
+	if err != nil {
+		panic(err)
+	}
+
+	var k = koanf.New(KeyDelimiter)
+	err = k.Load(rawbytes.Provider(buf.Bytes()), yaml.Parser())
+
+	if err != nil {
+		panic(err)
+	}
+
+	return k
+
+}
+
+func getParams(regEx, url string) (paramsMap map[string]string) {
+
+	var compRegEx = regexp.MustCompile(regEx)
+	match := compRegEx.FindStringSubmatch(url)
+
+	paramsMap = make(map[string]string)
+	for i, name := range compRegEx.SubexpNames() {
+		if i > 0 && i <= len(match) {
+			paramsMap[name] = match[i]
+		}
+	}
+	return paramsMap
 }
 
 // NewParserFromBuffer creates a new Parser by reading the given yaml buffer.
